@@ -1480,7 +1480,6 @@ func (m *Model) view() string {
 	if len(m.Value()) == 0 && m.row == 0 && m.col == 0 && m.Placeholder != "" {
 		return m.placeholderView()
 	}
-	m.virtualCursor.TextStyle = m.activeStyle().computedCursorLine()
 
 	var (
 		s                strings.Builder
@@ -1491,14 +1490,40 @@ func (m *Model) view() string {
 		styles           = m.activeStyle()
 	)
 
+	// Resolve the per-frame styles once, up front. Each computed* call
+	// walks full lipgloss style-inheritance chains; resolving them per
+	// wrapped line dominated view() CPU time on large buffers (#1023).
+	// The styles are invariant for the whole frame, so hoisting them is
+	// output-identical.
+	cursorLineStyle := styles.computedCursorLine()
+	textStyle := styles.computedText()
+	promptStyle := styles.computedPrompt()
+	selectionStyle := styles.computedSelection()
+	endOfBufferStyle := styles.computedEndOfBuffer()
+	lineNumberStyle := styles.computedLineNumber()
+	cursorLineNumberStyle := styles.computedCursorLineNumber()
+
+	m.virtualCursor.TextStyle = cursorLineStyle
+
+	// The prompt text is constant for the whole frame unless a promptFunc
+	// is set. Pre-render it (including the per-line style wrapping) once
+	// instead of twice per wrapped line.
+	var renderedPrompt, renderedCursorPrompt string
+	preRenderedPrompt := m.promptFunc == nil
+	if preRenderedPrompt {
+		promptText := promptStyle.Render(m.Prompt)
+		renderedPrompt = textStyle.Render(promptText)
+		renderedCursorPrompt = cursorLineStyle.Render(promptText)
+	}
+
 	displayLine := 0
 	for l, line := range m.value {
 		wrappedLines := m.memoizedWrap(line, m.width)
 
 		if m.row == l {
-			style = styles.computedCursorLine()
+			style = cursorLineStyle
 		} else {
-			style = styles.computedText()
+			style = textStyle
 		}
 
 		// wrappedBase is the index, within the logical line, of the first rune
@@ -1507,18 +1532,32 @@ func (m *Model) view() string {
 		wrappedBase := 0
 
 		for wl, wrappedLine := range wrappedLines {
-			prompt := m.promptView(displayLine)
-			s.WriteString(style.Render(prompt))
+			if preRenderedPrompt {
+				if m.row == l {
+					s.WriteString(renderedCursorPrompt)
+				} else {
+					s.WriteString(renderedPrompt)
+				}
+			} else {
+				prompt := m.promptView(displayLine, promptStyle)
+				s.WriteString(style.Render(prompt))
+			}
 			displayLine++
 
 			var ln string
 			if m.ShowLineNumbers {
+				isCursorLine := m.row == l
+				// Fold the cursor-line style choice into the style
+				// arguments so lineNumberView needs no per-call style
+				// resolution.
+				lnTextStyle, lnStyle := textStyle, lineNumberStyle
+				if isCursorLine {
+					lnTextStyle, lnStyle = cursorLineStyle, cursorLineNumberStyle
+				}
 				if wl == 0 { // normal line
-					isCursorLine := m.row == l
-					s.WriteString(m.lineNumberView(l+1, isCursorLine))
+					s.WriteString(m.lineNumberView(l+1, lnTextStyle, lnStyle))
 				} else { // soft wrapped line
-					isCursorLine := m.row == l
-					s.WriteString(m.lineNumberView(-1, isCursorLine))
+					s.WriteString(m.lineNumberView(-1, lnTextStyle, lnStyle))
 				}
 			}
 
@@ -1547,7 +1586,7 @@ func (m *Model) view() string {
 			// affordance, and mixing the two would double-style the same cell.
 			if selFrom, selTo, selected := m.selectionSpanFor(l, wrappedBase, len(wrappedLine)); selected {
 				s.WriteString(style.Render(string(wrappedLine[:selFrom])))
-				s.WriteString(styles.computedSelection().Render(string(wrappedLine[selFrom:selTo])))
+				s.WriteString(selectionStyle.Render(string(wrappedLine[selFrom:selTo])))
 				s.WriteString(style.Render(string(wrappedLine[selTo:])))
 			} else if m.row == l && lineInfo.RowOffset == wl {
 				s.WriteString(style.Render(string(wrappedLine[:lineInfo.ColumnOffset])))
@@ -1572,14 +1611,14 @@ func (m *Model) view() string {
 	// Always show at least `m.Height` lines at all times.
 	// To do this we can simply pad out a few extra new lines in the view.
 	for range m.height {
-		s.WriteString(m.promptView(displayLine))
+		s.WriteString(m.promptView(displayLine, promptStyle))
 		displayLine++
 
 		// Write end of buffer content
 		leftGutter := string(m.EndOfBufferCharacter)
 		rightGapWidth := m.Width() - uniseg.StringWidth(leftGutter) + widestLineNumber
 		rightGap := strings.Repeat(" ", max(0, rightGapWidth))
-		s.WriteString(styles.computedEndOfBuffer().Render(leftGutter + rightGap))
+		s.WriteString(endOfBufferStyle.Render(leftGutter + rightGap))
 		s.WriteRune('\n')
 	}
 
@@ -1598,8 +1637,9 @@ func (m Model) View() string {
 	return styles.Base.Render(view)
 }
 
-// promptView renders a single line of the prompt.
-func (m Model) promptView(displayLine int) (prompt string) {
+// promptView renders a single line of the prompt using the given
+// precomputed prompt style (see view for why the style is hoisted).
+func (m Model) promptView(displayLine int, promptStyle lipgloss.Style) (prompt string) {
 	prompt = m.Prompt
 	if m.promptFunc != nil {
 		prompt = m.promptFunc(PromptInfo{
@@ -1612,7 +1652,7 @@ func (m Model) promptView(displayLine int) (prompt string) {
 		}
 	}
 
-	return m.activeStyle().computedPrompt().Render(prompt)
+	return promptStyle.Render(prompt)
 }
 
 // lineNumberView renders the line number.
@@ -1620,9 +1660,10 @@ func (m Model) promptView(displayLine int) (prompt string) {
 // If the argument is less than 0, a space styled as a line number is returned
 // instead. Such cases are used for soft-wrapped lines.
 //
-// The second argument indicates whether this line number is for a 'cursorline'
-// line number.
-func (m Model) lineNumberView(n int, isCursorLine bool) (str string) {
+// textStyle and lineNumberStyle are the precomputed styles to use: the caller
+// passes either the regular or the cursor-line variants (see view for why the
+// styles are hoisted instead of resolved per call).
+func (m Model) lineNumberView(n int, textStyle, lineNumberStyle lipgloss.Style) (str string) {
 	if !m.ShowLineNumbers {
 		return ""
 	}
@@ -1631,14 +1672,6 @@ func (m Model) lineNumberView(n int, isCursorLine bool) (str string) {
 		str = " "
 	} else {
 		str = strconv.Itoa(n)
-	}
-
-	// XXX: is textStyle really necessary here?
-	textStyle := m.activeStyle().computedText()
-	lineNumberStyle := m.activeStyle().computedLineNumber()
-	if isCursorLine {
-		textStyle = m.activeStyle().computedCursorLine()
-		lineNumberStyle = m.activeStyle().computedCursorLineNumber()
 	}
 
 	// Format line number dynamically based on the maximum number of lines.
@@ -1655,6 +1688,13 @@ func (m Model) placeholderView() string {
 		p      = m.Placeholder
 		styles = m.activeStyle()
 	)
+	// Hoisted per-frame styles (same rationale as in view).
+	promptStyle := styles.computedPrompt()
+	placeholderStyle := styles.computedPlaceholder()
+	cursorLineStyle := styles.computedCursorLine()
+	textStyle := styles.computedText()
+	lineNumberStyle := styles.computedLineNumber()
+	cursorLineNumberStyle := styles.computedCursorLineNumber()
 	// word wrap lines
 	pwordwrap := ansi.Wordwrap(p, m.width, "")
 	// hard wrap lines (handles lines that could not be word wrapped)
@@ -1665,13 +1705,13 @@ func (m Model) placeholderView() string {
 	for i := range m.height {
 		isLineNumber := len(plines) > i
 
-		lineStyle := styles.computedPlaceholder()
+		lineStyle := placeholderStyle
 		if len(plines) > i {
-			lineStyle = styles.computedCursorLine()
+			lineStyle = cursorLineStyle
 		}
 
 		// render prompt
-		prompt := m.promptView(i)
+		prompt := m.promptView(i, promptStyle)
 		s.WriteString(lineStyle.Render(prompt))
 
 		// when show line numbers enabled:
@@ -1686,7 +1726,11 @@ func (m Model) placeholderView() string {
 				ln = i + 1
 				fallthrough
 			case len(plines) > i:
-				s.WriteString(m.lineNumberView(ln, isLineNumber))
+				lnTextStyle, lnStyle := textStyle, lineNumberStyle
+				if isLineNumber {
+					lnTextStyle, lnStyle = cursorLineStyle, cursorLineNumberStyle
+				}
+				s.WriteString(m.lineNumberView(ln, lnTextStyle, lnStyle))
 			default:
 			}
 		}
@@ -1695,14 +1739,14 @@ func (m Model) placeholderView() string {
 		// first line
 		case i == 0:
 			// first character of first line as cursor with character
-			m.virtualCursor.TextStyle = styles.computedPlaceholder()
+			m.virtualCursor.TextStyle = placeholderStyle
 
 			ch, rest, _, _ := uniseg.FirstGraphemeClusterInString(plines[0], 0)
 			m.virtualCursor.SetChar(ch)
 			s.WriteString(lineStyle.Render(m.virtualCursor.View()))
 
 			// the rest of the first line
-			s.WriteString(lineStyle.Render(styles.computedPlaceholder().Render(rest)))
+			s.WriteString(lineStyle.Render(placeholderStyle.Render(rest)))
 
 			// extend the first line with spaces to fill the width, so that
 			// the entire line is filled when cursorline is enabled.
@@ -1755,11 +1799,14 @@ func (m Model) Cursor() *tea.Cursor {
 
 	lineInfo := m.LineInfo()
 	w := lipgloss.Width
-	baseStyle := m.activeStyle().Base
+	styles := m.activeStyle()
+	baseStyle := styles.Base
 
+	// Only the visible widths matter here; the styles are irrelevant to
+	// lipgloss.Width, so pass the precomputed variants.
 	xOffset := lineInfo.CharOffset +
-		w(m.promptView(0)) +
-		w(m.lineNumberView(0, false)) +
+		w(m.promptView(0, styles.computedPrompt())) +
+		w(m.lineNumberView(0, styles.computedText(), styles.computedLineNumber())) +
 		baseStyle.GetMarginLeft() +
 		baseStyle.GetPaddingLeft() +
 		baseStyle.GetBorderLeftSize()
